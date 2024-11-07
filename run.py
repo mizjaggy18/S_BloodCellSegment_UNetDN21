@@ -158,7 +158,7 @@ def run(cyto_job, parameters):
     # output_layer = compiled_model.output(0)
 
     # modelpath="./models/bloodsegment_unet_100ep.pth"
-    modelpath="./models/best_unet_dn21_pytable_blood_segment_v4_bceloss_100.pth"
+    modelpath="/models/best_unet_dn21_pytable_blood_segment_v4_bceloss_100.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
     model = UNetWithDenseNetEncoder().to(device)  # Assuming binary segmentation with 1 output channel
