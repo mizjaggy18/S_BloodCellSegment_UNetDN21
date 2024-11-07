@@ -41,6 +41,7 @@ RUN pip install openvino-telemetry==2023.2.1
 RUN pip install opencv-python-headless==4.5.1.48
 RUN pip install opencv-contrib-python-headless==4.5.1.48
 RUN pip install tqdm
+RUN pip install sldc
 # RUN pip install numpy
 # RUN pip install shapely
 
