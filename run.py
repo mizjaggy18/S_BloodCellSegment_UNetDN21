@@ -51,6 +51,7 @@ import json
 import logging
 import logging.handlers
 import shutil
+from io import BytesIO
 
 __author__ = "WSH Munirah W Ahmad <wshmunirah@gmail.com>"
 __version__ = "1.0.1"
