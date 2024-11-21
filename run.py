@@ -14,8 +14,6 @@
 # * See the License for the specific language governing permissions and
 # * limitations under the License.
 
-# python3.10 run.py --cytomine_host "http://cytomine.imu.edu.my" --cytomine_public_key "71981a88-4e97-4551-a403-59d0dfccf5fd" --cytomine_private_key "36344b44-7539-4772-b1fb-d9ae7ec72182" --cytomine_id_project "77742" --cytomine_id_software "73644795" --cytomine_id_images "76061444" --cytomine_id_roi_term "1021768" --cytomine_id_cell_term "1021760" --cytomine_segment_th "0.5" --log_level "WARNING" --cytomine_area_th "0"
-
 from __future__ import print_function, unicode_literals, absolute_import, division
 
 
@@ -250,7 +248,7 @@ def run(cyto_job, parameters):
                 print(min_x)
                 print(min_y)
 
-                patch_size = 1024
+                patch_size = parameters.patch_size
                 overlap = 0.5
                 step = int(patch_size * (1 - overlap))  # 50% overlap
                 num_patches_x = (roi_width + step - 1) // step
