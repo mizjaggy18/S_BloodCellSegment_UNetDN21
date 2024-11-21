@@ -157,7 +157,6 @@ def run(cyto_job, parameters):
     # compiled_model = core.compile_model(model=ir_path, device_name='CPU')
     # output_layer = compiled_model.output(0)
 
-    # modelpath="./models/bloodsegment_unet_100ep.pth"
     modelpath="/models/best_unet_dn21_pytable_blood_segment_v4_bceloss_100.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -239,65 +238,101 @@ def run(cyto_job, parameters):
                     max_x=roi_geometry.bounds[2]
                     max_y=roi_geometry.bounds[3]
 
-                    roi_width=max_x - min_x
-                    roi_height=max_y - min_y
+                    roi_width=int(max_x - min_x)
+                    roi_height=int(max_y - min_y)
+
+                    combined_mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+
 
                     print("ROI width = ", roi_width)
                     print("ROI height = ", roi_height)
-                    
-                    #Dump ROI image into local PNG file
-                    roi_path=os.path.join(working_path,str(roi_annotations.project)+'/'+str(roi_annotations.image)+'/'+str(roi.id))
-                    roi_png_filename=os.path.join(roi_path+'/'+str(roi.id)+'.png')
-                    # print("roi_png_filename: %s" %roi_png_filename)
-                    is_algo = User().fetch(roi.user).algo
-                    roi.dump(dest_pattern=roi_png_filename,mask=True,alpha=not is_algo)
-                    #roi.dump(dest_pattern=os.path.join(roi_path,"{id}.png"), mask=True, alpha=True)
+                    print(min_x)
+                    print(min_y)
 
-                    roi_im=Image.open(roi_png_filename).convert('RGB')
-                    original_image_size = roi_im.size[::-1]  # PIL gives size as (width, height), we need (height, width)
+                    patch_size = 1024
+                    overlap = 0.5
+                    step = int(patch_size * (1 - overlap))  # 50% overlap
+                    num_patches_x = (roi_width + step - 1) // step
+                    num_patches_y = (roi_height + step - 1) // step
+                    print(f'Patch X: {num_patches_x}, Patch Y: {num_patches_y}')
+                    print(f'Step X: {step}, Step Y: {step}')
 
-                    transform = transforms.Compose([
-                        transforms.Resize((256, 256)),  # Resize to the same size used during training
-                        transforms.ToTensor()         # Convert the image to a PyTorch tensor
-                    ])
-                    roi_resize = transform(roi_im)  # Apply transformations
-                    image_tensor = roi_resize.unsqueeze(0)  # Add batch dimension (1, C, H, W)
 
-                    # Forward pass
-                    # th_seg = 0.5
-                    image_tensor = image_tensor.to(device)
-                    with torch.no_grad():
-                        output = model(image_tensor)  # Model outputs segmentation
+                    id_terms=parameters.cytomine_id_cell_term
 
-                    prediction = (output > th_seg).float()  # Shape: [1, 1, H, W]
-                    prediction = prediction.squeeze(1).long()  # Shape: [1, original_H, original_W]
-                    prediction = prediction.squeeze(0)
+                    for i in range(0, roi_height - patch_size + 1, step):
+                        for j in range(0, roi_width - patch_size + 1, step):                        
+                            # Adjust i and j for the last patch in each direction to fit within ROI boundaries
+                            if i + patch_size > roi_height:
+                                i = roi_height - patch_size
+                            if j + patch_size > roi_width:
+                                j = roi_width - patch_size
+                            # Calculate the coordinates in the whole-slide image (WSI) system
+                            patch_x = int(min_x) + j
+                            patch_y = int(wsi_height - max_y) + i
 
-                    # Get predicted segmentation output
-                    original_width, original_height = roi_im.size
-                    zoom_factors = (original_height / prediction.shape[0], original_width / prediction.shape[1])
-                    prediction = prediction.cpu().numpy()
-                    seg_preds_resized = zoom(prediction, zoom_factors, order=0)  # Nearest neighbor interpolation (order=0)
+                            # print(patch_x)
+                            # print(patch_y)
+                            x, y, w, h = patch_x, patch_y, patch_size, patch_size
+                            response = cyto_job.get_instance()._get(
+                                "{}/{}/window-{}-{}-{}-{}.{}".format("imageinstance", id_image, x, y, w, h, "png"),{})
+                            
+                            if response.status_code in [200, 304] and response.headers['Content-Type'] == 'image/png':
+                                roi_im = Image.open(BytesIO(response.content))
+                                gray_im = roi_im.convert("L")
+                                min_pixel, max_pixel = gray_im.getextrema()
+                                if min_pixel == 255 and max_pixel == 255:
+                                    continue   
+
+                                transform = transforms.Compose([
+                                    transforms.Resize((256, 256)),  
+                                    transforms.ToTensor()         
+                                ])
+                                roi_resize = transform(roi_im)  # Apply transformations
+                                image_tensor = roi_resize.unsqueeze(0)  # Add batch dimension (1, C, H, W)
+
+                                # Forward pass
+                                # th_seg = 0.5
+                                image_tensor = image_tensor.to(device)
+                                with torch.no_grad():
+                                    output = model(image_tensor)  # Model outputs segmentation
+
+                                prediction = (output > th_seg).float()  # Shape: [1, 1, H, W]
+                                # prediction_resized = F.interpolate(
+                                #     prediction, size=original_image_size, mode='nearest'
+                                # )  # Shape: [1, 1, original_H, original_W]
+                                prediction = prediction.squeeze(1).long()  # Shape: [1, original_H, original_W]
+                                prediction = prediction.squeeze(0)
+
+                                original_width, original_height = roi_im.size
+                                zoom_factors = (original_height / prediction.shape[0], original_width / prediction.shape[1])
+                                prediction = prediction.cpu().numpy()
+                                seg_preds_resized = zoom(prediction, zoom_factors, order=0) 
+                                # seg_preds_resized = resize(seg_preds, (patch_size, patch_size), order=0, preserve_range=True, anti_aliasing=False)
+
+                                combined_mask[i:i + patch_size, j:j + patch_size] = np.logical_or(
+                                    combined_mask[i:i + patch_size, j:j + patch_size],
+                                    seg_preds_resized
+                                ).astype(np.uint8)
 
                     # Zoom factor for WSI
                     bit_depth = 8 #imageinfo.bitDepth if imageinfo.bitDepth is not None else 8
                     zoom_factor = 1
                     transform_matrix = [zoom_factor, 0, 0, -zoom_factor, min_x, max_y]
                     extension = 10
-                    cytomine_annotations = AnnotationCollection()
-                    id_terms=parameters.cytomine_id_cell_term
-                    fg_objects = mask_to_objects_2d(seg_preds_resized)
+                    fg_objects = mask_to_objects_2d(combined_mask)    
+
+                    job.update(status=Job.RUNNING, progress=30, statusComment='Uploading annotations...')
 
                     for i, (fg_poly, _) in enumerate(fg_objects):
                         upscaled = affine_transform(fg_poly, transform_matrix)
-                        outer_boundary = Polygon(upscaled.exterior)
-                        upscaled = outer_boundary
-
                         Annotation(
                             location=upscaled.wkt,
                             id_image=id_image,
                             id_terms=[id_terms],
                             id_project=project.id).save()                    
+                        # except:
+                        #     print("An exception occurred. Proceed with next annotations")                                
 
                 except:
                 # finally:
