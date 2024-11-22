@@ -50,6 +50,8 @@ import logging
 import logging.handlers
 import shutil
 from io import BytesIO
+from openvino.runtime import Dimension, PartialShape
+import openvino as ov
 
 __author__ = "WSH Munirah W Ahmad <wshmunirah@gmail.com>"
 __version__ = "1.0.1"
@@ -125,6 +127,25 @@ class UNetWithDenseNetEncoder(nn.Module):
         return x
 
 
+def process_prediction(output, i, j, roi_im_size, combined_mask, patch_size, th_seg):
+    prediction = (output > th_seg).float().cpu().numpy()
+    prediction = prediction.squeeze()
+    
+    # Ensure zoom_factors matches the dimensions of prediction
+    if prediction.ndim == 2:  # 2D array (height x width)
+        zoom_factors = (roi_im_size[1] / prediction.shape[0], roi_im_size[0] / prediction.shape[1])
+    elif prediction.ndim == 3:  # 3D array (channels x height x width)
+        zoom_factors = (1, roi_im_size[1] / prediction.shape[1], roi_im_size[0] / prediction.shape[2])
+    
+    # Resize prediction to match the original ROI dimensions
+    seg_preds_resized = zoom(prediction, zoom_factors, order=1)
+    
+    # Update the combined mask
+    combined_mask[i:i + patch_size, j:j + patch_size] = np.logical_or(
+        combined_mask[i:i + patch_size, j:j + patch_size],
+        seg_preds_resized
+    ).astype(np.uint8)
+
 
 def run(cyto_job, parameters):
     logging.info("----- PCa-Semantic-UNet-DenseNet v%s -----", __version__)
@@ -141,29 +162,14 @@ def run(cyto_job, parameters):
 
     start_time=time.time()
 
-    # # Paths where ONNX and OpenVINO IR models will be stored.
-    # # ir_path = weights_path.with_suffix(".xml")
-    # # ir_path = "/models/pc-cb-2class_dn21adam_best_model_100ep.xml"
-    # ir_path = "/models/pc-cb-3class-v2_dn21adam_best_model_100ep.xml"
-
-    # # Instantiate OpenVINO Core
-    # core = ov.Core()
-
-    # # Read model to OpenVINO Runtime
-    # #model_ir = core.read_model(model=ir_path)
-
-    # # Load model on device
-    # compiled_model = core.compile_model(model=ir_path, device_name='CPU')
-    # output_layer = compiled_model.output(0)
-
-    modelpath="/models/best_unet_dn21_pytable_blood_segment_v4_bceloss_100.pth"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
-    model = UNetWithDenseNetEncoder().to(device)  # Assuming binary segmentation with 1 output channel
-    # model.load_state_dict(torch.load(modelpath, map_location=torch.device('cpu')))
-    model.load_state_dict(torch.load(modelpath, map_location=device))
-    model.eval()  # Set the model to evaluation mode
-    model.to(device)
+    ir_path = "/models/best_unet_dn21_pytable_blood_segment_v4_bceloss_100.xml"
+    core = ov.Core()
+    model_ir = core.read_model(model=ir_path)
+    # compiled_model = core.compile_model(model=ir_path, device_name='GPU')    
+    # Set the model input shape to dynamic
+    model_ir.reshape({0: PartialShape([Dimension.dynamic(), 3, 256, 256])})
+    compiled_model = core.compile_model(model=model_ir, device_name='GPU')
+    output_layer = compiled_model.output(0)
     
     # ------------------------
 
@@ -183,22 +189,11 @@ def run(cyto_job, parameters):
     print('Print list images:', list_imgs2)
     job.update(status=Job.RUNNING, progress=30, statusComment="Images gathered...")
 
-    #Set working path
-    working_path = os.path.join("tmp", str(job.id))
-   
-    if not os.path.exists(working_path):
-        logging.info("Creating working directory: %s", working_path)
-        os.makedirs(working_path)
-
     ###################################
     try:
 
         id_project=project.id   
-        output_path = os.path.join(working_path, "classification_results.csv")
-        f= open(output_path,"w+")
-
-        f.write("AnnotationID;ImageID;ProjectID;JobID;TermID;UserID;Area;Perimeter;Hue;Value;WKT \n")
-        
+         
         #Go over images
         for id_image in list_imgs2:
 
@@ -256,66 +251,87 @@ def run(cyto_job, parameters):
                 print(f'Patch X: {num_patches_x}, Patch Y: {num_patches_y}')
                 print(f'Step X: {step}, Step Y: {step}')
 
-
+                batch_size=64
+                batch = []
+                coordinates = []
                 id_terms=parameters.cytomine_id_cell_term
 
-                for i in range(0, roi_height - patch_size + 1, step):
-                    for j in range(0, roi_width - patch_size + 1, step):                        
-                        # Adjust i and j for the last patch in each direction to fit within ROI boundaries
+                for i in range(0, roi_height, step):
+                    for j in range(0, roi_width, step):
                         if i + patch_size > roi_height:
-                            i = roi_height - patch_size
+                                i = roi_height - patch_size
                         if j + patch_size > roi_width:
                             j = roi_width - patch_size
-                        # Calculate the coordinates in the whole-slide image (WSI) system
+                        # Prepare each patch as before
                         patch_x = int(min_x) + j
                         patch_y = int(wsi_height - max_y) + i
-
-                        # print(patch_x)
-                        # print(patch_y)
-                        x, y, w, h = patch_x, patch_y, patch_size, patch_size
                         response = cyto_job.get_instance()._get(
-                            "{}/{}/window-{}-{}-{}-{}.{}".format("imageinstance", id_image, x, y, w, h, "png"),{})
-                        
+                            "{}/{}/window-{}-{}-{}-{}.{}".format("imageinstance", id_image, patch_x, patch_y, patch_size, patch_size, "png"), {}
+                        )
+
                         if response.status_code in [200, 304] and response.headers['Content-Type'] == 'image/png':
                             roi_im = Image.open(BytesIO(response.content))
-                            gray_im = roi_im.convert("L")
-                            min_pixel, max_pixel = gray_im.getextrema()
-                            if min_pixel == 255 and max_pixel == 255:
-                                continue   
-
                             transform = transforms.Compose([
-                                transforms.Resize((256, 256)),  
-                                transforms.ToTensor()         
+                                transforms.Resize((256, 256)),
+                                transforms.ToTensor()
                             ])
-                            roi_resize = transform(roi_im)  # Apply transformations
-                            image_tensor = roi_resize.unsqueeze(0)  # Add batch dimension (1, C, H, W)
+                            roi_resize = transform(roi_im)
+                            batch.append(roi_resize)
+                            coordinates.append((i, j))
 
-                            # Forward pass
-                            # th_seg = 0.5
-                            image_tensor = image_tensor.to(device)
+                        # Process the batch when it reaches the desired size
+                        if len(batch) >= batch_size:
+                            batch_tensor = torch.stack(batch).to(device)
+                            batch_numpy = batch_tensor.cpu().numpy()  # Move to CPU and convert to NumPy
+
                             with torch.no_grad():
-                                output = model(image_tensor)  # Model outputs segmentation
+                                results = compiled_model([batch_numpy])  # Pass the input to OpenVINO model
+                                outputs = results[output_layer]  # Extract output from the specified output layer
 
-                            prediction = (output > th_seg).float()  # Shape: [1, 1, H, W]
-                            # prediction_resized = F.interpolate(
-                            #     prediction, size=original_image_size, mode='nearest'
-                            # )  # Shape: [1, 1, original_H, original_W]
-                            prediction = prediction.squeeze(1).long()  # Shape: [1, original_H, original_W]
-                            prediction = prediction.squeeze(0)
+                            # Convert the outputs back to a PyTorch tensor if needed
+                            outputs_tensor = torch.from_numpy(outputs)
 
-                            original_width, original_height = roi_im.size
-                            zoom_factors = (original_height / prediction.shape[0], original_width / prediction.shape[1])
-                            prediction = prediction.cpu().numpy()
-                            seg_preds_resized = zoom(prediction, zoom_factors, order=0) 
-                            # seg_preds_resized = resize(seg_preds, (patch_size, patch_size), order=0, preserve_range=True, anti_aliasing=False)
+                            for output, (i, j) in zip(outputs_tensor, coordinates):
+                                process_prediction(
+                                    output=output,
+                                    i=i,
+                                    j=j,
+                                    roi_im_size=roi_im.size,  # Pass the size of the ROI image
+                                    combined_mask=combined_mask,
+                                    patch_size=patch_size,
+                                    th_seg=th_seg
+                                )
 
-                            combined_mask[i:i + patch_size, j:j + patch_size] = np.logical_or(
-                                combined_mask[i:i + patch_size, j:j + patch_size],
-                                seg_preds_resized
-                            ).astype(np.uint8)
+                            # Reset batch and coordinates
+                            batch = []
+                            coordinates = []
+
+                # Process any remaining patches
+                if batch:
+                    batch_tensor = torch.stack(batch).to(device)
+                    batch_numpy = batch_tensor.cpu().numpy()
+                    # with torch.no_grad():
+                    #     outputs = model(batch_tensor)
+                    with torch.no_grad():
+                        results = compiled_model([batch_numpy])  # Pass the input to OpenVINO model
+                        outputs = results[output_layer]  # Extract output from the specified output layer
+
+                    # Convert the outputs back to a PyTorch tensor if needed
+                    outputs_tensor = torch.from_numpy(outputs)
+
+                    for output, (i, j) in zip(outputs_tensor, coordinates):
+                        process_prediction(
+                                output=output,
+                                i=i,
+                                j=j,
+                                roi_im_size=roi_im.size,  # Pass the size of the ROI image
+                                combined_mask=combined_mask,
+                                patch_size=patch_size,
+                                th_seg=th_seg
+                            )
 
                 # Zoom factor for WSI
-                bit_depth = 8 #imageinfo.bitDepth if imageinfo.bitDepth is not None else 8
+                bit_depth = 8
                 zoom_factor = 1
                 transform_matrix = [zoom_factor, 0, 0, -zoom_factor, min_x, max_y]
                 extension = 10
@@ -323,13 +339,18 @@ def run(cyto_job, parameters):
 
                 job.update(status=Job.RUNNING, progress=30, statusComment='Uploading annotations...')
 
-                for i, (fg_poly, _) in enumerate(fg_objects):
+                annotations = AnnotationCollection()
+
+                for fg_poly, _ in fg_objects:
                     upscaled = affine_transform(fg_poly, transform_matrix)
-                    Annotation(
+                    annotations.append(Annotation(
                         location=upscaled.wkt,
                         id_image=id_image,
                         id_terms=[id_terms],
-                        id_project=project.id).save()                    
+                        id_project=project.id
+                    ))
+                # Save all annotations at once
+                annotations.save()                    
                         # except:
                         #     print("An exception occurred. Proceed with next annotations")                                
 
@@ -339,22 +360,12 @@ def run(cyto_job, parameters):
                 #     print("An exception occurred. Proceed with next annotations")
                 #################################################
 
-
             end_prediction_time=time.time()
-
-            f.write("\n")
-            f.write("Image ID;Class Prediction;Class 0 (Others);Class 1 (Necrotic);Class 2 (Tumor);Total Prediction;Execution Time;Prediction Time\n")
-            # f.write("{};{};{};{};{};{};{};{}\n".format(id_image,im_pred,pred_c0,pred_c1,pred_c2,pred_total,end_time-start_time,end_prediction_time-start_prediction_time))
-            
-        f.close()
         
-        job.update(status=Job.RUNNING, progress=99, statusComment="Summarizing results...")
-        job_data = JobData(job.id, "Generated File", "classification_results.csv").save()
-        job_data.upload(output_path)
+        job.update(status=Job.RUNNING, progress=85, statusComment="Completing...")
+
     #################################################
     finally:
-        logging.info("Deleting folder %s", working_path)
-        shutil.rmtree(working_path, ignore_errors=True)
         logging.debug("Leaving run()")
     #################################################
 
