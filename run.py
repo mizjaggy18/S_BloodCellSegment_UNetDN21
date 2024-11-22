@@ -170,6 +170,8 @@ def run(cyto_job, parameters):
     model_ir.reshape({0: PartialShape([Dimension.dynamic(), 3, 256, 256])})
     compiled_model = core.compile_model(model=model_ir, device_name='CPU')
     output_layer = compiled_model.output(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
     
     # ------------------------
 
