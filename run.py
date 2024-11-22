@@ -168,7 +168,7 @@ def run(cyto_job, parameters):
     # compiled_model = core.compile_model(model=ir_path, device_name='GPU')    
     # Set the model input shape to dynamic
     model_ir.reshape({0: PartialShape([Dimension.dynamic(), 3, 256, 256])})
-    compiled_model = core.compile_model(model=model_ir, device_name='GPU')
+    compiled_model = core.compile_model(model=model_ir, device_name='CPU')
     output_layer = compiled_model.output(0)
     
     # ------------------------
